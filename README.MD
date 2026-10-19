@@ -1,100 +1,57 @@
+# ML Inference Scheduler
 
----
+A load-aware scheduler that routes ML inference requests across mixed GPU and CPU workers, with shared state in Redis and metrics in Prometheus/Grafana.
 
-# Fine-Grained ML Inference Scheduler
+## Problem
 
-![Status](https://img.shields.io/badge/Status-Complete-brightgreen)
-![License](https://img.shields.io/badge/License-MIT-blue.svg)
+Inference fleets are rarely uniform. A few fast GPU workers sit beside slower CPU workers, and request volume arrives in bursts. Round-robin load balancing treats every worker as equal, so fast workers sit idle while queues build on slow ones. This project asks a narrow question: **what does a simple, observable, load-aware router look like, and where does it break?**
 
-## 🌟 Project Overview
+## Architecture
 
-This project presents a distributed, fine-grained resource scheduler designed to optimize the serving of Machine Learning inference requests on heterogeneous hardware environments (e.g., a mix of GPU-like and CPU-like compute resources). In real-world ML deployments, efficiently utilizing diverse hardware to minimize latency and maximize throughput under dynamic loads is a significant challenge.
-
-This system addresses these challenges by intelligently routing incoming inference requests to the most suitable and least-loaded worker in real-time. It showcases a robust architecture leveraging modern microservices patterns, centralized state management, and comprehensive observability.
-
-## 💡 Problem Statement
-
-Inference serving for large-scale ML models often faces bottlenecks due to:
-* **Heterogeneous Hardware:** Balancing workloads across machines with varying processing capabilities (e.g., high-performance GPUs vs. general-purpose CPUs).
-* **Dynamic Workloads:** Handling unpredictable spikes and troughs in request volume.
-* **Latency & Throughput Requirements:** Ensuring low response times and high request processing rates.
-* **Resource Underutilization:** Static load balancing often leaves expensive, high-capacity resources idle while queues build up elsewhere.
-
-## ✨ Key Features & Solution Highlights
-
-* **Intelligent Scheduling:** Implements a greedy-first algorithm prioritizing faster (simulated GPU) workers and dynamically routing requests based on real-time load.
-* **Distributed Architecture:** Built as a set of FastAPI microservices (Scheduler, Workers) for scalability and modularity.
-* **Real-time State Management:** Leverages Redis for centralizing worker registration, load tracking, and heartbeat monitoring, ensuring up-to-date cluster insights.
-* **Heterogeneous Worker Simulation:** Workers are configured to simulate different inference latencies, mimicking real-world hardware diversity.
-* **Comprehensive Observability:** Integrated with Prometheus for metric collection and Grafana for real-time visualization of key performance indicators like latency, throughput, and worker utilization.
-* **Containerized Deployment:** All services are containerized with Docker and orchestrated using Docker Compose for easy setup and reproducibility.
-
-## 🧱 Architecture Overview
-
-```
-[Client] → [Scheduler] → [GPU Worker] / [CPU Worker]
-                        ↕
-                     [Redis]
-                       ↕
-             [Prometheus & Grafana]
+```mermaid
+flowchart LR
+    C[client.py<br/>burst load] -->|POST /infer| S[Scheduler<br/>FastAPI :8000]
+    S <-->|worker registry<br/>per-worker load| R[(Redis)]
+    S -->|POST /process| G[GPU worker<br/>simulated 50 ms]
+    S -->|POST /process| P[CPU worker<br/>simulated 200 ms]
+    G & P -->|register| R
+    S & G & P -->|/metrics| M[Prometheus :9090] --> D[Grafana :3000]
 ```
 
-## ⚙️ Running Locally
+**Scheduling policy** (`scheduler_app.py`): read all registered workers and their in-flight load from Redis, sort each pool by load, send to the least-loaded GPU worker if it has capacity, otherwise the least-loaded CPU worker, otherwise return `503`. Load is incremented in Redis before dispatch and decremented in `finally`, so failures don't leak capacity.
 
-### Prerequisites
+**Metrics exported:** request count, end-to-end latency histogram, per-worker load, active workers by type, queue depth.
 
-* Docker & Docker Compose
-* Python 3.9+ (for the test client)
+## Run it
 
-### Setup
+Requires Docker with Compose and Python 3.9+ for the client.
 
 ```bash
-git clone https://github.com/your-username/ml-inference-scheduler.git
+git clone https://github.com/falakshair01/ml-inference-scheduler.git
 cd ml-inference-scheduler
-docker-compose up --build -d
+docker compose up --build -d
+pip install -r requirements.txt
+python client.py          # 500 requests at concurrency 30, writes request_results.json
 ```
 
-Verify services:
+- Scheduler: http://localhost:8000
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3000 (default `admin`/`admin` on first login; change it)
 
-```bash
-docker-compose ps
-```
+## Results
 
-Access:
+Workers are **simulated** with fixed latencies (`SIM_LATENCY=0.05` for GPU, `0.20` for CPU), so results show scheduling behavior, not real model performance. Raw per-request output from a run is in `request_results.json`; dashboards and discussion are in the [write-up on Medium](https://medium.com/p/9d5575895c10).
 
-* Grafana: [http://localhost:3000](http://localhost:3000) (`admin`/`admin`)
-* Prometheus: [http://localhost:9090](http://localhost:9090)
+## Known limitations
 
-### Run Test Client
+These are the next things I would fix, and the reasons the design is a prototype:
 
-Install deps and run:
+- **Race between check and increment.** Load is read, compared and then incremented in separate Redis calls, so concurrent requests can overshoot a worker's capacity. Fix: an atomic Lua script or `INCR`-then-check-and-rollback.
+- **Blocking Redis client in async handlers.** `redis.Redis` blocks the event loop; `redis.asyncio` is the correct client.
+- **Static capacity.** Every worker has a hard-coded capacity of 2 in-flight requests regardless of type.
+- **No queueing.** When all workers are busy the scheduler returns `503` instead of holding the request.
+- **Simulated hardware.** The natural next step is to replace the workers with real model servers (e.g. vLLM on GPU, ONNX Runtime on CPU) and measure p50/p99 latency and throughput against a round-robin baseline.
 
-```bash
-python client.py
-```
+## Author
 
-The `client.py` script bursts inference requests to observe scheduling behavior under load.
-
-## 📈 Metrics & Results
-
-Performance metrics (e.g., **request latency**, **worker utilization**) are tracked and visualized in Grafana.
-
-For detailed graphs and analysis, check out the blog post:
-👉 [Read the Medium article](https://medium.com/p/9d5575895c10)
-
-## 🧪 Future Improvements
-
-This project serves as a robust foundation. Potential areas for future exploration include:
-
-- More Sophisticated Scheduling Algorithms: Implementing Reinforcement Learning (RL) or other advanced heuristics for dynamic, adaptive scheduling policies.
-- Dynamic Worker Scaling: Integrating with cloud providers (e.g., AWS ECS/EKS, Kubernetes) for automated horizontal scaling of worker instances based on load.
-- Request Prioritization: Adding support for high-priority requests to bypass queues or be routed to dedicated resources.
-- Fault Tolerance & Resilience: Enhancing error handling and recovery mechanisms for worker failures.
-- Cost Optimization: Incorporating cost models into scheduling decisions to minimize operational expenses.
-
-## 👤 Author
-
-**Falak Shair**
-[GitHub](https://github.com/falakshair01) | [LinkedIn](https://www.linkedin.com/in/falak-shair-software-engineer/)
-
----
+Falak Shair · [LinkedIn](https://www.linkedin.com/in/falak-shair-software-engineer) · [Medium](https://medium.com/@falakshair563)
